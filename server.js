@@ -74,23 +74,20 @@ document.getElementById("btn-ip").onclick = async () => {
     return res.end(html);
   }
 
-    // 2) ПРОФИЛЬ ДЛЯ iOS (WebClip): создаёт ярлык "Sphere" на Домой
-  if (req.url === "/Sphere.mobileconfig") {
-    const targetUrl = "https://" + req.headers.host + "/app"; // куда откроется ярлык
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  // 2) ПРОФИЛЬ ДЛЯ iOS (WebClip, без MDM): ярлык "Sphere" на Домой
+if (req.url === "/Sphere.mobileconfig") {
+  const targetUrl = "https://" + req.headers.host + "/app"; // куда откроется ярлык
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
   <dict>
     <key>PayloadContent</key>
     <array>
       <dict>
-        <key>FullScreen</key><true/>
         <key>IsRemovable</key><true/>
         <key>Label</key><string>Sphere</string>
-        <key>PayloadDescription</key><string>WebClip for Sphere</string>
-        <key>PayloadDisplayName</key><string>Sphere WebClip</string>
         <key>PayloadIdentifier</key><string>com.sphere.webclip</string>
-        <key>PayloadType</key><string>com.apple.webClip.managed</string>
+        <key>PayloadType</key><string>com.apple.webClip</string>
         <key>PayloadUUID</key><string>9F3C6AE8-9D8E-4E1B-9F11-1234567890AB</string>
         <key>PayloadVersion</key><integer>1</integer>
         <key>Precomposed</key><true/>
@@ -105,12 +102,12 @@ document.getElementById("btn-ip").onclick = async () => {
     <key>PayloadVersion</key><integer>1</integer>
   </dict>
 </plist>`;
-    res.writeHead(200, {
-      "Content-Type": "application/x-apple-aspen-config",
-      "Content-Disposition": 'attachment; filename="Sphere.mobileconfig"'
-    });
-    return res.end(xml);
-  }
+  res.writeHead(200, {
+    "Content-Type": "application/x-apple-aspen-config",
+    "Content-Disposition": 'attachment; filename="Sphere.mobileconfig"'
+  });
+  return res.end(xml);
+}
 
   // 3) /fetch?url=... — reverse-proxy (для демонстрации "скрытия IP")
   if (req.url.startsWith("/fetch")) {
@@ -180,4 +177,5 @@ server.on("connect", (req, clientSocket, head) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
+
 
