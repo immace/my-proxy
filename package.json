@@ -1,13 +1,16 @@
 {
-  "name": "sphere-emulator-proxy",
+  "name": "my-proxy",
   "version": "1.0.0",
+  "description": "Sphere demo server (static UI + reverse proxy via upstream proxy)",
   "main": "server.js",
   "type": "commonjs",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "http-proxy": "^1.18.1",
-    "node-html-parser": "^6.1.10",
-    "http-proxy-agent": "^7.0.2",
-    "https-proxy-agent": "^7.0.4"
+    "proxy-agent": "^6.3.1"
   }
 }
