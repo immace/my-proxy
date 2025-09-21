@@ -5,9 +5,10 @@
 
   // ==== CSS (сферная тема)
   const css = `
-  :root{--bg:#07090b;--fg:#e9edf2;--muted:#9aa3ad;--line:#151a1f;--panel:#0e1116;--chip:#10141a;--chip-line:#212831;--danger:#ff5f57}
+  :root{--bg:#07090b;--fg:#e9edf2;--muted:#9aa3ad;--line:#151a1f;--panel:#0e1116;--chip:#10141a;--chip-line:#212831;--danger:#ff5f57;--hdr:56px}
   *{box-sizing:border-box} html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:400 16px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"SF Pro Text","Segoe UI",Roboto}
-  .titlebar{position:fixed;left:12px;right:12px;top:calc(env(safe-area-inset-top) + 10px);height:56px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;border:1px solid var(--line);border-radius:16px;background:rgba(10,12,14,.65);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);z-index:20}
+  /* ↓ Шапка ниже, без рамки */
+  .titlebar{position:fixed;left:12px;right:12px;top:calc(env(safe-area-inset-top) + 22px);height:var(--hdr);display:grid;grid-template-columns:1fr auto 1fr;align-items:center;border:0;border-radius:16px;background:rgba(10,12,14,.78);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);z-index:20}
   .brand{justify-self:center;letter-spacing:.18em;font-weight:800}
   .stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
   .grid-bg{position:absolute;inset:-20% -10% -10% -10%;background:radial-gradient(1200px 700px at 50% 0%, #0c0f13 0%, #07090b 60%);pointer-events:none}
@@ -94,7 +95,6 @@
   $("#tgStart").onclick = async ()=>{
     const cfg = await api.config();
     if (!cfg.botName){ alert("TG-бот не настроен на сервере."); return; }
-    // Показать мини-диалог с виджетом
     const wrap = document.createElement("div");
     wrap.style.cssText="margin-top:12px";
     wrap.innerHTML = '<div class="hint" style="margin-bottom:6px">Нажми кнопку Telegram внизу:</div><div id="tg-slot"></div>';
@@ -109,7 +109,6 @@
     s.setAttribute("data-request-access","write");
     s.setAttribute("data-radius","8");
     $("#tg-slot").appendChild(s);
-    // кнопку больше не показываем, чтобы не дублировать
     $("#tgStart").disabled = true;
   };
 
@@ -129,11 +128,7 @@
         let photo="";
         const doSend = async ()=>{
           const resp = await api.saveName({name,handle,photo});
-          if (!resp.ok && resp.status){ // если пришёл Response
-            const t = await resp.text().catch(()=> "");
-            showErr(t==="handle_taken" ? "Ник уже занят" : "Некорректный ник");
-            return;
-          }
+          if (!resp.ok){ const t = await resp.text().catch(()=> ""); showErr(t==="handle_taken"?"Ник уже занят":"Некорректный ник"); return; }
           $("#nameDlg").close(); boot();
         };
         if (f){ const r=new FileReader(); r.onload=e=>{ photo=e.target.result; doSend(); }; r.readAsDataURL(f); }
@@ -141,7 +136,6 @@
       };
       return;
     }
-    // сцена
     if (me.photo){ $("#avatarBg").style.backgroundImage=`url(${me.photo})`; $("#avatarBg").style.display="block"; }
     $("#view-login").style.display="none";
     $("#view-scene").style.display="flex";
@@ -173,7 +167,7 @@
       const r=document.createElement("div"); r.className="row"; r.textContent=n.name;
       r.onclick=async ()=>{
         const resp=await api.spheres.add(n);
-        if (resp.status===409) return; // дубликат
+        if (resp.status===409) return;
         spheres = await api.spheres.list();
         $("#pickerDlg").close();
         renderSpheres();
@@ -184,17 +178,17 @@
     $("#pickerDlg").showModal();
   }
 
+  // === Эмулятор: шапка ниже, без рамки; iframe до самого низа
   function openEmu(s){
     const panel=document.createElement("div");
-    panel.style.cssText="position:fixed;inset:0;background:#0b0d10;z-index:50;display:flex;flex-direction:column";
+    panel.style.cssText="position:fixed;inset:0;background:#0b0d10;z-index:50;display:flex;flex-direction:column;height:100vh";
     panel.innerHTML =
-      '<div class="titlebar" style="position:relative;top:0;margin:10px 12px 0;grid-template-columns:1fr auto 1fr;background:rgba(13,16,20,.85)">' +
-      `  <div style="padding-left:8px;font-weight:700">${s.name}</div>` +
-      '  <div class="brand">SPHERE</div>' +
-      '  <div style="justify-self:end;margin-right:8px;width:16px;height:16px;border-radius:50%;background:var(--danger);box-shadow:inset 0 0 0 1px #cc3a33,0 0 0 1px #2a1010;cursor:pointer" id="closeBtn"></div>' +
-      '</div>' +
-      '<div style="height:10px"></div>' +
-      '<iframe id="emu" style="flex:1;border:0;background:#000" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>';
+      `<div class="titlebar" style="position:relative;margin:calc(env(safe-area-inset-top) + 16px) 12px 8px;border:0;background:rgba(13,16,20,.88)">
+         <div style="padding-left:8px;font-weight:700">${s.name}</div>
+         <div class="brand">SPHERE</div>
+         <div style="justify-self:end;margin-right:8px;width:16px;height:16px;border-radius:50%;background:var(--danger);box-shadow:inset 0 0 0 1px #cc3a33,0 0 0 1px #2a1010;cursor:pointer" id="closeBtn"></div>
+       </div>
+       <div id="emuWrap" style="position:relative;flex:1;"><iframe id="emu" style="position:absolute;inset:0;border:0;background:#000" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe></div>`;
     document.body.appendChild(panel);
     $("#closeBtn",panel).onclick=()=>panel.remove();
     $("#emu",panel).src="/m?url="+encodeURIComponent(s.url);
