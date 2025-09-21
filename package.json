@@ -6,6 +6,8 @@
   "scripts": { "start": "node server.js" },
   "dependencies": {
     "http-proxy": "^1.18.1",
-    "node-html-parser": "^6.1.10"
+    "node-html-parser": "^6.1.10",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.4"
   }
 }
