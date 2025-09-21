@@ -74,10 +74,9 @@ document.getElementById("btn-ip").onclick = async () => {
     return res.end(html);
   }
 
-  // 2) ПРОФИЛЬ ДЛЯ iOS (WebClip): создаёт ярлык "Sphere" на Домой
+    // 2) ПРОФИЛЬ ДЛЯ iOS (WebClip): создаёт ярлык "Sphere" на Домой
   if (req.url === "/Sphere.mobileconfig") {
-    // URL, который откроется из ярлыка (ставим на нашу страницу /app)
-    const targetUrl = "https://" + req.headers.host + "/app";
+    const targetUrl = "https://" + req.headers.host + "/app"; // куда откроется ярлык
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -102,7 +101,7 @@ document.getElementById("btn-ip").onclick = async () => {
     <key>PayloadIdentifier</key><string>com.sphere.profile</string>
     <key>PayloadRemovalDisallowed</key><false/>
     <key>PayloadType</key><string>Configuration</string>
-    <key>PayloadUUID</key><string>6B7E9E1C-3C1A-4A4B-B0D2-ABCDEF012345</key>
+    <key>PayloadUUID</key><string>6B7E9E1C-3C1A-4A4B-B0D2-ABCDEF012345</string>
     <key>PayloadVersion</key><integer>1</integer>
   </dict>
 </plist>`;
@@ -181,3 +180,4 @@ server.on("connect", (req, clientSocket, head) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
+
