@@ -11,14 +11,21 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
-const ProxyAgent = require("proxy-agent");
+const createProxyAgent = require("proxy-agent");
 
 const PORT = process.env.PORT || 8080;
 const STATIC_DIR = path.join(__dirname, "public");
 
 // --- env ---
 const UPSTREAM_PROXY = process.env.UPSTREAM_PROXY || ""; // e.g. http://user:pass@host:port
-const upstreamAgent = UPSTREAM_PROXY ? new ProxyAgent(UPSTREAM_PROXY) : undefined;
+let upstreamAgent;
+try {
+  upstreamAgent = UPSTREAM_PROXY ? createProxyAgent(UPSTREAM_PROXY) : undefined;
+  if (UPSTREAM_PROXY) console.log("Using upstream proxy:", UPSTREAM_PROXY);
+} catch (e) {
+  console.error("Bad UPSTREAM_PROXY:", UPSTREAM_PROXY, e.message);
+  upstreamAgent = undefined; // продолжаем без апстрим-прокси, чтобы сервис не падал
+}
 
 const PROXY_USER = process.env.PROXY_USER || "student";
 const PROXY_PASS = process.env.PROXY_PASS || "mypassword";
@@ -228,3 +235,4 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log("SPHERE server listening on " + PORT);
 });
+
