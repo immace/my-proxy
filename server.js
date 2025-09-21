@@ -168,15 +168,26 @@ function renderUnauthed(){
   root.innerHTML = \`
   <div class="center">
     <div style="font-size:17px;font-weight:700">Вход в Sphere</div>
-    \${BOT_NAME
-      ? \`<script async src="https://telegram.org/js/telegram-widget.js?22"
-          data-telegram-login="\${BOT_NAME}"
-          data-size="large"
-          data-auth-url="/auth/telegram"
-          data-request-access="write"></script>\`
-      : '<div class="muted">TG-бот не настроен (нет TG_BOT_NAME/TG_BOT_TOKEN)</div>'}
+    <div id="tg-root"></div>
+    <div id="tg-missing" class="muted" style="display:none">
+      TG-бот не настроен (нет TG_BOT_NAME/TG_BOT_TOKEN)
+    </div>
     <button class="btn" onclick="testProxy()">Показать IP через прокси</button>
   </div>\`;
+
+  // безопасно добавляем Telegram Login без <script> в строке
+  if (BOT_NAME) {
+    const s = document.createElement("script");
+    s.async = true;
+    s.src = "https://telegram.org/js/telegram-widget.js?22";
+    s.setAttribute("data-telegram-login", BOT_NAME);
+    s.setAttribute("data-size", "large");
+    s.setAttribute("data-auth-url", "/auth/telegram");
+    s.setAttribute("data-request-access", "write");
+    document.getElementById("tg-root").appendChild(s);
+  } else {
+    document.getElementById("tg-missing").style.display = "block";
+  }
 }
 
 function renderNamePrompt(){
