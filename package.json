@@ -1,12 +1,13 @@
 {
-  "name": "my-proxy",
+  "name": "sphere-proxy",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
-  "dependencies": {
-    "http-proxy": "^1.18.1"
-  },
+  "engines": { "node": ">=18" },
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1"
   }
 }
