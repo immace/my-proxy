@@ -1,14 +1,32 @@
-// server.js — прокси + страница Sphere + установка ярлыка на iOS через .mobileconfig
+// server.js — Sphere: веб-приложение + Telegram-логин + тумблер Proxy + профиль .mobileconfig
+// Работает на Render. Эндпоинты:
+//   /app                       — UI Sphere
+//   /Sphere.mobileconfig       — профиль для ярлыка на iOS
+//   /fetch?url=...             — прокси-запрос через наш сервер (демонстрирует “чужой IP”)
+//   /api/me, /auth/telegram    — авторизация через Telegram Login Widget
+//   /healthz                   — проверка живости
+// Плюс оставлен форвард-прокси/CONNECT (может блокироваться Cloudflare/PaaS).
 
 const http = require("http");
 const https = require("https");
 const net = require("net");
+const crypto = require("crypto");
 const httpProxy = require("http-proxy");
 const { URL } = require("url");
 
-// креды для /fetch и форвард-прокси
-const USER = process.env.PROXY_USER || "student";
-const PASS = process.env.PROXY_PASS || "mypassword";
+// ====== Настройки (меняй в Render → Environment) =========================
+const USER = process.env.PROXY_USER || "student";   // логин для /fetch
+const PASS = process.env.PROXY_PASS || "mypassword";// пароль для /fetch
+const BOT_NAME = process.env.TG_BOT_NAME || "";     // @username твоего бота (без @)
+const BOT_TOKEN = process.env.TG_BOT_TOKEN || "";   // токен бота (у BotFather)
+const SESSION_SECRET = process.env.SESSION_SECRET || "change_me_secret";
+// =======================================================================
+
+function setCORS(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "authorization, content-type");
+}
 
 function authOk(req) {
   const h = req.headers["proxy-authorization"] || req.headers["authorization"];
@@ -19,22 +37,78 @@ function authOk(req) {
   return decoded === `${USER}:${PASS}`;
 }
 
-function setCORS(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "authorization, content-type");
+// простая “подписанная” сессия (без БД)
+function signSession(payloadObj) {
+  const json = JSON.stringify(payloadObj);
+  const b64 = Buffer.from(json, "utf8").toString("base64url");
+  const mac = crypto.createHmac("sha256", SESSION_SECRET).update(b64).digest("base64url");
+  return `${b64}.${mac}`;
+}
+function verifySession(token) {
+  if (!token) return null;
+  const [b64, mac] = token.split(".");
+  const mac2 = crypto.createHmac("sha256", SESSION_SECRET).update(b64).digest("base64url");
+  if (mac !== mac2) return null;
+  try { return JSON.parse(Buffer.from(b64, "base64url").toString("utf8")); }
+  catch { return null; }
+}
+function getCookies(req) {
+  const c = req.headers.cookie || "";
+  const out = {};
+  c.split(";").forEach(p => {
+    const i = p.indexOf("="); if (i>0) out[p.slice(0,i).trim()] = decodeURIComponent(p.slice(i+1));
+  });
+  return out;
+}
+function setCookie(res, name, val, days=30) {
+  const exp = new Date(Date.now()+days*864e5).toUTCString();
+  res.setHeader("Set-Cookie", `${name}=${encodeURIComponent(val)}; Path=/; Expires=${exp}; HttpOnly; SameSite=Lax; Secure`);
+}
+
+// верификация Telegram Login (https://core.telegram.org/widgets/login)
+function checkTelegramAuth(data) {
+  // data: объект из query/body (ключи: id, first_name, auth_date, hash, и т.д.)
+  if (!BOT_TOKEN) return null;
+  const { hash, ...rest } = data;
+  const keys = Object.keys(rest).sort();
+  const dataCheckString = keys.map(k => `${k}=${rest[k]}`).join("\n");
+  const secret = crypto.createHash("sha256").update(BOT_TOKEN).digest();
+  const hmac = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
+  if (hmac !== hash) return null;
+  // опционально — проверка свежести (в пределах дня)
+  const now = Math.floor(Date.now()/1000);
+  if (Math.abs(now - Number(rest.auth_date||now)) > 86400) return null;
+  return {
+    id: String(rest.id),
+    username: rest.username || "",
+    first_name: rest.first_name || "",
+    last_name: rest.last_name || "",
+    photo_url: rest.photo_url || ""
+  };
+}
+
+function readBody(req) {
+  return new Promise(resolve => {
+    const chunks = [];
+    req.on("data", d => chunks.push(d));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      resolve(raw);
+    });
+  });
 }
 
 const proxy = httpProxy.createProxyServer({});
-const server = http.createServer((req, res) => {
-  // 0) healthcheck без авторизации
+const server = http.createServer(async (req, res) => {
+  // 0) healthz
   if (req.url === "/healthz") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    return res.end("ok");
+    res.writeHead(200, {"Content-Type":"text/plain"}); return res.end("ok");
   }
 
-  // 1) СТРАНИЦА ПРИЛОЖЕНИЯ (откроется из ярлыка Sphere)
-  if (req.url === "/app") {
+  // 1) UI Sphere
+  if (req.url.startsWith("/app")) {
+    const isAuthed = !!verifySession(getCookies(req).sid);
+    const host = req.headers.host;
     const html = `<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"/>
@@ -43,139 +117,253 @@ const server = http.createServer((req, res) => {
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Sphere</title>
 <style>
-  html,body{height:100%;margin:0;background:#0a0b0c;color:#e8e8e8;font-family:-apple-system,system-ui,Segoe UI,Roboto}
-  .top{position:fixed;inset:0 auto auto 0;right:0;height:52px;display:flex;gap:8px;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #1b1e22;background:rgba(12,13,14,0.85);backdrop-filter:blur(6px);z-index:2}
-  .btn{padding:8px 12px;border:1px solid #2a2e33;border-radius:10px;color:#cfd3d8;background:#121416}
-  .frame{position:absolute;left:0;right:0;top:52px;bottom:0;border:0;width:100%;height:calc(100% - 52px);background:#000}
+  :root{--bg:#0b0d10;--panel:#121418;--line:#1f2329;--text:#e8e8e8;--muted:#a7b0bb;--accent:#6dd5ff}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,system-ui,Segoe UI,Roboto}
+  .top{position:fixed;left:0;right:0;top:0;height:56px;display:flex;gap:10px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:rgba(12,13,14,.9);backdrop-filter:blur(6px);z-index:2}
+  .brand{font-weight:800;letter-spacing:.6px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--text)}
+  .toggle{width:38px;height:22px;border-radius:999px;border:1px solid var(--line);background:#222;position:relative}
+  .dot{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#666;transition:.2s}
+  .on .dot{left:18px;background:#1ee2a1}
+  .content{position:absolute;inset:56px 0 0 0;padding:14px}
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:16px;padding:14px}
+  .row{display:flex;align-items:center;justify-content:space-between}
+  .muted{color:var(--muted)}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:12px}
+  .app{aspect-ratio:1/1;border:1px dashed var(--line);border-radius:14px;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .app.add{border-style:solid;color:var(--text)}
+  .btn{padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--text)}
+  iframe.browser{width:100%;height:60vh;border:1px solid var(--line);border-radius:12px;background:#000;margin-top:12px}
+  .center{display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;height:calc(100% - 56px)}
+  .telbtn{display:inline-block;padding:10px 14px;border-radius:12px;background:#27a7e7;color:#fff;text-decoration:none}
+  input.name{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:#0f1114;color:var(--text)}
 </style>
 </head><body>
 <div class="top">
-  <div style="font-weight:700;letter-spacing:.5px">SPHERE</div>
-  <button class="btn" id="btn-ip">Показать IP через прокси</button>
+  <div class="brand">SPHERE</div>
+  <div class="chip" id="proxyChip">
+    <span>Proxy:</span>
+    <div class="toggle" id="proxyToggle"><div class="dot"></div></div>
+  </div>
 </div>
 
-<!-- Если есть собственный интерфейс, подставь сюда свой HTML/URL -->
-<iframe class="frame" src="about:blank" title="Sphere UI"></iframe>
+<div class="content" id="appRoot"></div>
 
 <script>
 const PROXY_BASE = "/fetch";
 const AUTH = "Basic " + btoa("${USER}:${PASS}");
+const state = { proxy: true, me: null, services: [] };
 
-document.getElementById("btn-ip").onclick = async () => {
+async function apiMe(){ const r = await fetch("/api/me",{credentials:"include"}); return r.json(); }
+async function loginName(name){
+  await fetch("/api/name", {method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include", body:JSON.stringify({name})});
+  state.me = await apiMe(); render();
+}
+
+function setProxy(on){ state.proxy = !!on; document.getElementById("proxyToggle").classList.toggle("on", state.proxy); }
+
+async function testProxy(){
   try{
     const r = await fetch(PROXY_BASE + "?url=https://api.ipify.org", { headers:{Authorization: AUTH} });
     const ip = await r.text();
     alert("IP через прокси: " + ip);
   }catch(e){ alert("Ошибка: " + e.message); }
-};
+}
+
+function openService(url){
+  const target = state.proxy ? (PROXY_BASE + "?url=" + encodeURIComponent(url)) : url;
+  const browser = document.getElementById("browser");
+  if (browser){ browser.src = target; window.scrollTo(0, document.body.scrollHeight); }
+  else{
+    const ifr = document.createElement("iframe");
+    ifr.className = "browser";
+    ifr.id = "browser";
+    ifr.src = target;
+    document.getElementById("appRoot").appendChild(ifr);
+  }
+}
+
+// UI
+function renderUnauthed(){
+  const root = document.getElementById("appRoot");
+  root.innerHTML = \`
+  <div class="center">
+    <div style="font-size:17px;font-weight:700">Вход в Sphere</div>
+    ${BOT_NAME ? \`<script async src="https://telegram.org/js/telegram-widget.js?22"
+      data-telegram-login="${BOT_NAME}"
+      data-size="large"
+      data-auth-url="/auth/telegram"
+      data-request-access="write"></script>\`
+      : '<div class="muted">TG-бот не настроен (нет TG_BOT_NAME/TG_BOT_TOKEN)</div>'}
+    <button class="btn" onclick="testProxy()">Показать IP через прокси</button>
+  </div>\`;
+}
+
+function renderNamePrompt(){
+  const root = document.getElementById("appRoot");
+  root.innerHTML = \`
+    <div class="card">
+      <div style="font-size:16px;font-weight:700;margin-bottom:8px">Как к тебе обращаться?</div>
+      <input class="name" id="nameInput" placeholder="Имя"/><br/>
+      <button class="btn" onclick="loginName(document.getElementById('nameInput').value)">Сохранить</button>
+    </div>\`;
+}
+
+function renderAuthed(){
+  const root = document.getElementById("appRoot");
+  const name = (state.me && state.me.name) || (state.me && state.me.first_name) || "User";
+  root.innerHTML = \`
+    <div class="card">
+      <div class="row">
+        <div>
+          <div style="font-weight:700">Привет, \${name}</div>
+          <div class="muted">Все запросы из Sphere можно пускать через наш прокси.</div>
+        </div>
+        <button class="btn" onclick="testProxy()">IP через прокси</button>
+      </div>
+      <div class="grid" style="margin-top:12px">
+        <div class="app add" onclick="openService('https://m.wikipedia.org/')">+</div>
+        <div class="app" onclick="openService('https://m.youtube.com/')">YouTube</div>
+        <div class="app" onclick="openService('https://m.twitter.com/')">X</div>
+        <div class="app" onclick="openService('https://lite.bing.com/')">Search</div>
+      </div>
+    </div>\`;
+}
+
+async function boot(){
+  setProxy(true);
+  document.getElementById("proxyToggle").onclick = () => setProxy(!state.proxy);
+  state.me = await apiMe();
+  if (!state.me || !state.me.id){ renderUnauthed(); }
+  else if (!state.me.name){ renderNamePrompt(); }
+  else { renderAuthed(); }
+}
+boot();
 </script>
 </body></html>`;
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.writeHead(200, {"Content-Type":"text/html; charset=utf-8"});
     return res.end(html);
   }
 
-  // 2) ПРОФИЛЬ ДЛЯ iOS (WebClip, без MDM): ярлык "Sphere" на Домой
-if (req.url === "/Sphere.mobileconfig") {
-  const targetUrl = "https://" + req.headers.host + "/app"; // куда откроется ярлык
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  // 2) Профиль .mobileconfig (ярлык Sphere на Домой)
+  if (req.url === "/Sphere.mobileconfig") {
+    const targetUrl = "https://" + req.headers.host + "/app";
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-  <dict>
-    <key>PayloadContent</key>
-    <array>
-      <dict>
-        <key>IsRemovable</key><true/>
-        <key>Label</key><string>Sphere</string>
-        <key>PayloadIdentifier</key><string>com.sphere.webclip</string>
-        <key>PayloadType</key><string>com.apple.webClip</string>
-        <key>PayloadUUID</key><string>9F3C6AE8-9D8E-4E1B-9F11-1234567890AB</string>
-        <key>PayloadVersion</key><integer>1</integer>
-        <key>Precomposed</key><true/>
-        <key>URL</key><string>${targetUrl}</string>
-      </dict>
-    </array>
-    <key>PayloadDisplayName</key><string>Sphere Profile</string>
-    <key>PayloadIdentifier</key><string>com.sphere.profile</string>
-    <key>PayloadRemovalDisallowed</key><false/>
-    <key>PayloadType</key><string>Configuration</string>
-    <key>PayloadUUID</key><string>6B7E9E1C-3C1A-4A4B-B0D2-ABCDEF012345</string>
-    <key>PayloadVersion</key><integer>1</integer>
-  </dict>
-</plist>`;
-  res.writeHead(200, {
-    "Content-Type": "application/x-apple-aspen-config",
-    "Content-Disposition": 'attachment; filename="Sphere.mobileconfig"'
-  });
-  return res.end(xml);
-}
+<plist version="1.0"><dict>
+  <key>PayloadContent</key><array>
+    <dict>
+      <key>IsRemovable</key><true/>
+      <key>Label</key><string>Sphere</string>
+      <key>PayloadIdentifier</key><string>com.sphere.webclip</string>
+      <key>PayloadType</key><string>com.apple.webClip</string>
+      <key>PayloadUUID</key><string>9F3C6AE8-9D8E-4E1B-9F11-1234567890AB</string>
+      <key>PayloadVersion</key><integer>1</integer>
+      <key>Precomposed</key><true/>
+      <key>URL</key><string>${targetUrl}</string>
+      <key>FullScreen</key><true/>
+    </dict>
+  </array>
+  <key>PayloadDisplayName</key><string>Sphere Profile</string>
+  <key>PayloadIdentifier</key><string>com.sphere.profile</string>
+  <key>PayloadRemovalDisallowed</key><false/>
+  <key>PayloadType</key><string>Configuration</string>
+  <key>PayloadUUID</key><string>6B7E9E1C-3C1A-4A4B-B0D2-ABCDEF012345</string>
+  <key>PayloadVersion</key><integer>1</integer>
+</dict></plist>`;
+    res.writeHead(200, {
+      "Content-Type": "application/x-apple-aspen-config",
+      "Content-Disposition": 'attachment; filename="Sphere.mobileconfig"'
+    });
+    return res.end(xml);
+  }
 
-  // 3) /fetch?url=... — reverse-proxy (для демонстрации "скрытия IP")
+  // 3) API авторизации
+  if (req.url.startsWith("/api/me")) {
+    const me = verifySession(getCookies(req).sid) || {};
+    res.writeHead(200, {"Content-Type":"application/json"}); return res.end(JSON.stringify(me));
+  }
+  if (req.url.startsWith("/api/name") && req.method === "POST") {
+    const me = verifySession(getCookies(req).sid) || {};
+    const raw = await readBody(req); let name = "";
+    try { name = JSON.parse(raw).name || ""; } catch {}
+    const upd = { ...me, name: String(name).slice(0,40) };
+    const sid = signSession(upd);
+    setCookie(res, "sid", sid);
+    res.writeHead(200, {"Content-Type":"application/json"}); return res.end(JSON.stringify({ok:true}));
+  }
+  if (req.url.startsWith("/auth/telegram")) {
+    // Telegram шлёт данные либо как query (GET), либо как x-www-form-urlencoded (POST)
+    let data = {};
+    if (req.method === "POST") {
+      const raw = await readBody(req);
+      raw.split("&").forEach(p=>{ const [k,v] = p.split("="); if(k) data[decodeURIComponent(k)] = decodeURIComponent(v||""); });
+    } else {
+      const q = new URL(req.url, "http://local").searchParams;
+      q.forEach((v,k)=> data[k]=v);
+    }
+    const user = checkTelegramAuth(data);
+    if (!user) { res.writeHead(400, {"Content-Type":"text/plain"}); return res.end("Bad Telegram login"); }
+    const sid = signSession({ id:user.id, first_name:user.first_name, username:user.username });
+    setCookie(res, "sid", sid);
+    // вернём на /app
+    res.writeHead(302, { "Location": "/app" }); return res.end();
+  }
+
+  // 4) /fetch?url=... — reverse proxy (GET)
   if (req.url.startsWith("/fetch")) {
     if (req.method === "OPTIONS") { setCORS(res); res.writeHead(204); return res.end(); }
     setCORS(res);
-    if (!authOk(req)) {
-      res.writeHead(401, { "WWW-Authenticate": 'Basic realm="Proxy"' });
-      return res.end("Auth required");
-    }
+    if (!authOk(req)) { res.writeHead(401, {"WWW-Authenticate":'Basic realm="Proxy"'}); return res.end("Auth required"); }
     try {
       const q = new URL(req.url, "http://local");
       const target = q.searchParams.get("url");
-      if (!target) { res.writeHead(400); return res.end("Missing url param"); }
+      if (!target) { res.writeHead(400); return res.end("Missing url"); }
       const t = new URL(target);
-      if (t.protocol !== "http:" && t.protocol !== "https:") {
-        res.writeHead(400); return res.end("Only http/https allowed");
-      }
+      if (!/^https?:$/.test(t.protocol)) { res.writeHead(400); return res.end("Only http/https"); }
       const mod = t.protocol === "https:" ? https : http;
-      const upstream = mod.request({
-        hostname: t.hostname,
-        port: t.port || (t.protocol === "https:" ? 443 : 80),
-        path: t.pathname + (t.search || ""),
-        method: "GET",
-        headers: { "User-Agent": req.headers["user-agent"] || "curl", "Accept": "*/*" },
+      const up = mod.request({
+        hostname: t.hostname, port: t.port || (t.protocol==="https:"?443:80),
+        path: t.pathname + (t.search||""), method: "GET",
+        headers: { "User-Agent": req.headers["user-agent"]||"Sphere", "Accept":"*/*" },
         timeout: 15000
-      }, up => {
-        const headers = { ...up.headers, "access-control-allow-origin": "*" };
-        res.writeHead(up.statusCode || 502, headers);
-        up.pipe(res);
+      }, u => {
+        const h = { ...u.headers, "access-control-allow-origin":"*" };
+        delete h["x-frame-options"]; delete h["content-security-policy"];
+        res.writeHead(u.statusCode||200, h); u.pipe(res);
       });
-      upstream.on("error", e => { res.writeHead(502); res.end("Fetch error: " + e.message); });
-      upstream.end();
-    } catch (e) {
-      res.writeHead(400); return res.end("Bad url: " + e.message);
-    }
+      up.on("error", e => { res.writeHead(502); res.end("Fetch error: "+e.message); });
+      up.end();
+    } catch(e){ res.writeHead(400); res.end("Bad url: "+e.message); }
     return;
   }
 
-  // 4) Форвард-прокси (может блокироваться Cloudflare)
+  // 5) Форвард-прокси (на всякий; может блокироваться PaaS)
   if (!authOk(req)) {
     res.writeHead(407, { "Proxy-Authenticate": 'Basic realm="Proxy"' });
     return res.end("Proxy auth required");
   }
   proxy.web(req, res, { target: req.url, changeOrigin: true }, (err) => {
-    res.writeHead(502);
-    res.end("Bad gateway: " + err.message);
+    res.writeHead(502); res.end("Bad gateway: "+err.message);
   });
 });
 
+// HTTPS CONNECT
 server.on("connect", (req, clientSocket, head) => {
   if (!authOk(req)) {
     clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
     return clientSocket.end();
   }
-  const [host, port] = (req.url || "").split(":");
-  const serverSocket = net.connect(port || 443, host, () => {
+  const [host, port] = (req.url||"").split(":");
+  const serverSocket = net.connect(port||443, host, () => {
     clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
     if (head?.length) serverSocket.write(head);
-    serverSocket.pipe(clientSocket);
-    clientSocket.pipe(serverSocket);
+    serverSocket.pipe(clientSocket); clientSocket.pipe(serverSocket);
   });
-  serverSocket.on("error", () => {
-    clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-    clientSocket.end();
-  });
+  serverSocket.on("error", () => { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); });
 });
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
+server.listen(PORT, () => console.log("Sphere running on "+PORT));
 
 
