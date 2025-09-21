@@ -4,7 +4,7 @@ const net = require("net");
 const httpProxy = require("http-proxy");
 
 const USER = "student";
-const PASS = "mypassword"; // поменяй пароль
+const PASS = "mypassword";
 
 function checkAuth(header) {
   if (!header) return false;
@@ -16,11 +16,19 @@ function checkAuth(header) {
 
 const proxy = httpProxy.createProxyServer({});
 const server = http.createServer((req, res) => {
+  // ✅ healthcheck без авторизации — ДОЛЖЕН быть раньше проверки пароля
+  if (req.url === "/healthz") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("ok");
+  }
+
+  // дальше всё как было: требует Basic-авторизацию
   const pa = req.headers["proxy-authorization"];
   if (!checkAuth(pa)) {
     res.writeHead(407, { "Proxy-Authenticate": 'Basic realm="Proxy"' });
     return res.end("Proxy auth required");
   }
+
   proxy.web(req, res, { target: req.url, changeOrigin: true }, (err) => {
     res.writeHead(502);
     res.end("Bad gateway: " + err.message);
@@ -31,7 +39,7 @@ server.on("connect", (req, clientSocket, head) => {
   const auth = req.headers["proxy-authorization"];
   if (!checkAuth(auth)) {
     clientSocket.write(
-      "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"
+      'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n'
     );
     return clientSocket.end();
   }
@@ -50,5 +58,7 @@ server.on("connect", (req, clientSocket, head) => {
   });
 });
 
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+// На Render не забудь слушать process.env.PORT
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log("Proxy listening on " + PORT));
+
