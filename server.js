@@ -163,6 +163,103 @@ function openService(url){
 }
 
 // UI
+if (req.url.startsWith("/app")) {
+  const html = `<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Sphere</title>
+<style>
+  :root{
+    --safe-top: env(safe-area-inset-top, 0px);
+    --bg:#0b0d10; --panel:#121418; --line:#1f2329; --text:#e8e8e8; --muted:#a7b0bb;
+    --topH: calc(56px + var(--safe-top));
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,system-ui,Segoe UI,Roboto;
+    -webkit-text-size-adjust:100%;}
+  .top{
+    position:fixed; left:0; right:0; top:0;
+    height:var(--topH);
+    display:flex; gap:10px; align-items:flex-end; justify-content:space-between;
+    padding: calc(8px + var(--safe-top)) 16px 10px 16px;
+    border-bottom:1px solid var(--line);
+    background:rgba(12,13,14,.92); backdrop-filter:blur(6px); z-index:2;
+  }
+  .brand{font-weight:800;letter-spacing:.6px; user-select:none; -webkit-user-select:none;}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--panel)}
+  .toggle{width:38px;height:22px;border-radius:999px;border:1px solid var(--line);background:#222;position:relative}
+  .dot{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#666;transition:.2s}
+  .on .dot{left:18px;background:#1ee2a1}
+  .content{
+    position:fixed; left:0; right:0; top:var(--topH); bottom:0;
+    padding:14px; overflow:auto; -webkit-overflow-scrolling:touch;
+  }
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:16px;padding:14px}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .muted{color:var(--muted)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(72px,1fr));gap:12px;margin-top:12px}
+  .app{aspect-ratio:1/1;border:1px dashed var(--line);border-radius:14px;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .app.add{border-style:solid;color:#e8e8e8}
+  .btn{padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:#e8e8e8;
+    touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+  iframe.browser{width:100%;height:60vh;border:1px solid var(--line);border-radius:12px;background:#000;margin-top:12px}
+  .center{display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;min-height:calc(100% - 1px)}
+  input.name{width:100%;padding:12px;border-radius:10px;border:1px solid var(--line);background:#0f1114;color:#e8e8e8}
+</style>
+</head><body>
+<div class="top">
+  <div class="brand">SPHERE</div>
+  <div class="chip" id="proxyChip">
+    <span>Proxy:</span>
+    <div class="toggle" id="proxyToggle"><div class="dot"></div></div>
+  </div>
+</div>
+
+<div class="content" id="appRoot"></div>
+
+<script>
+const PROXY_BASE = "/fetch";
+const AUTH = "Basic " + btoa("${USER}:${PASS}");
+const BOT_NAME = ${JSON.stringify(BOT_NAME)};
+const state = { proxy: true, me: null };
+
+async function apiMe(){ const r = await fetch("/api/me",{credentials:"include"}); return r.json(); }
+async function loginName(name){
+  await fetch("/api/name", {method:"POST", headers:{"Content-Type":"application/json"}, credentials:"include", body:JSON.stringify({name})});
+  state.me = await apiMe(); rerender();
+}
+function rerender(){
+  if (!state.me || !state.me.id) renderUnauthed();
+  else if (!state.me.name) renderNamePrompt();
+  else renderAuthed();
+}
+
+function setProxy(on){ state.proxy = !!on; document.getElementById("proxyToggle").classList.toggle("on", state.proxy); }
+
+async function testProxy(){
+  try{
+    const r = await fetch(PROXY_BASE + "?url=https://api.ipify.org", { headers:{Authorization: AUTH} });
+    const ip = await r.text();
+    alert("IP через прокси: " + ip);
+  }catch(e){ alert("Ошибка: " + e.message); }
+}
+
+function openService(url){
+  const target = state.proxy ? (PROXY_BASE + "?url=" + encodeURIComponent(url)) : url;
+  const browser = document.getElementById("browser");
+  if (browser){ browser.src = target; window.scrollTo(0, document.body.scrollHeight); }
+  else{
+    const ifr = document.createElement("iframe");
+    ifr.className = "browser";
+    ifr.id = "browser";
+    ifr.src = target;
+    document.getElementById("appRoot").appendChild(ifr);
+  }
+}
+
+// ========== Screens ==========
 function renderUnauthed(){
   const root = document.getElementById("appRoot");
   root.innerHTML = \`
@@ -172,10 +269,10 @@ function renderUnauthed(){
     <div id="tg-missing" class="muted" style="display:none">
       TG-бот не настроен (нет TG_BOT_NAME/TG_BOT_TOKEN)
     </div>
-    <button class="btn" onclick="testProxy()">Показать IP через прокси</button>
+    <button class="btn" id="ipBtn">Показать IP через прокси</button>
   </div>\`;
+  document.getElementById("ipBtn").addEventListener("click", testProxy);
 
-  // безопасно добавляем Telegram Login без <script> в строке
   if (BOT_NAME) {
     const s = document.createElement("script");
     s.async = true;
@@ -195,9 +292,15 @@ function renderNamePrompt(){
   root.innerHTML = \`
     <div class="card">
       <div style="font-size:16px;font-weight:700;margin-bottom:8px">Как к тебе обращаться?</div>
-      <input class="name" id="nameInput" placeholder="Имя"/><br/>
-      <button class="btn" onclick="loginName(document.getElementById('nameInput').value)">Сохранить</button>
+      <input class="name" id="nameInput" placeholder="Имя" autocomplete="name" />
+      <br/>
+      <button class="btn" id="saveName">Сохранить</button>
     </div>\`;
+  document.getElementById("saveName").addEventListener("click", () => {
+    const v = document.getElementById("nameInput").value.trim();
+    if (!v) return alert("Введите имя");
+    loginName(v);
+  });
 }
 
 function renderAuthed(){
@@ -210,31 +313,34 @@ function renderAuthed(){
           <div style="font-weight:700">Привет, \${name}</div>
           <div class="muted">Все запросы из Sphere можно пускать через наш прокси.</div>
         </div>
-        <button class="btn" onclick="testProxy()">IP через прокси</button>
+        <button class="btn" id="checkIp">IP через прокси</button>
       </div>
       <div class="grid" style="margin-top:12px">
-        <div class="app add" onclick="openService('https://m.wikipedia.org/')">+</div>
-        <div class="app" onclick="openService('https://m.youtube.com/')">YouTube</div>
-        <div class="app" onclick="openService('https://m.twitter.com/')">X</div>
-        <div class="app" onclick="openService('https://lite.bing.com/')">Search</div>
+        <div class="app add" id="addApp">+</div>
+        <div class="app" id="yt">YouTube</div>
+        <div class="app" id="xapp">X</div>
+        <div class="app" id="search">Search</div>
       </div>
     </div>\`;
+  document.getElementById("checkIp").addEventListener("click", testProxy);
+  document.getElementById("addApp").addEventListener("click", () => openService('https://m.wikipedia.org/'));
+  document.getElementById("yt").addEventListener("click", () => openService('https://m.youtube.com/'));
+  document.getElementById("xapp").addEventListener("click", () => openService('https://m.twitter.com/'));
+  document.getElementById("search").addEventListener("click", () => openService('https://lite.bing.com/'));
 }
 
 async function boot(){
   setProxy(true);
   document.getElementById("proxyToggle").onclick = () => setProxy(!state.proxy);
   state.me = await apiMe();
-  if (!state.me || !state.me.id){ renderUnauthed(); }
-  else if (!state.me.name){ renderNamePrompt(); }
-  else { renderAuthed(); }
+  rerender();
 }
 boot();
 </script>
 </body></html>`;
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    return res.end(html);
-  }
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  return res.end(html);
+}
 
   // профиль для iOS
   if (req.url === "/Sphere.mobileconfig") {
@@ -350,3 +456,4 @@ server.on("connect", (req, clientSocket, head) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log("Sphere running on " + PORT));
+
