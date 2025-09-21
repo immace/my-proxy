@@ -1,13 +1,11 @@
 {
-  "name": "sphere-proxy",
+  "name": "sphere-emulator-proxy",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
-  "engines": { "node": ">=18" },
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "http-proxy": "^1.18.1"
+    "http-proxy": "^1.18.1",
+    "node-html-parser": "^6.1.10"
   }
 }
