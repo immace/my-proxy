@@ -181,6 +181,3 @@ server.on("connect", (req, clientSocket, head) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
-ёт PORT сам
-server.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
-
