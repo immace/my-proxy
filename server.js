@@ -5,6 +5,8 @@ const crypto = require("crypto");
 const httpProxy = require("http-proxy");
 const { URL } = require("url");
 const { parse } = require("node-html-parser");
+const { HttpProxyAgent } = require("http-proxy-agent");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 
 // ===== ENV =====
 const USER = process.env.PROXY_USER || "student";
@@ -13,120 +15,110 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "change_me_secret";
 const PORT = process.env.PORT || 8080;
 // ===============
 
-// ---- utils
+// ---- helpers
 function setCORS(res){ res.setHeader("Access-Control-Allow-Origin","*"); res.setHeader("Access-Control-Allow-Methods","GET, POST, OPTIONS"); res.setHeader("Access-Control-Allow-Headers","authorization, content-type"); }
 function authOk(req){ const h=req.headers["proxy-authorization"]||req.headers["authorization"]; if(!h) return false; const p=h.split(" "); if(p.length!==2) return false; return Buffer.from(p[1],"base64").toString()===USER+":"+PASS; }
 function getCookies(req){ const out={}; (req.headers.cookie||"").split(";").forEach(s=>{const i=s.indexOf("="); if(i>0) out[s.slice(0,i).trim()]=decodeURIComponent(s.slice(i+1));}); return out; }
-function setCookie(res,name,val,days=30){ const exp=new Date(Date.now()+days*864e5).toUTCString(); res.setHeader("Set-Cookie",`${name}=${encodeURIComponent(val)}; Path=/; Expires=${exp}; HttpOnly; SameSite=Lax; Secure`); }
-
-// простенькая «соль» на сессию
+function setCookie(res,name,val,days=365){ const exp=new Date(Date.now()+days*864e5).toUTCString(); res.setHeader("Set-Cookie",`${name}=${encodeURIComponent(val)}; Path=/; Expires=${exp}; HttpOnly; SameSite=Lax; Secure`); }
 function newSid(){ return crypto.randomBytes(16).toString("hex"); }
+function readBody(req){ return new Promise(r=>{ const ch=[]; req.on("data",d=>ch.push(d)); req.on("end",()=>r(Buffer.concat(ch).toString("utf8"))); }); }
 
-// ---- cookie-jar в памяти: sid -> host -> cookieString
-const JAR = new Map();
-function jarGet(sid, host){ const j=JAR.get(sid)||{}; return j[host]||""; }
-function jarSet(sid, host, setCookieHeaders){
+// ---- sessions & profiles (RAM)
+const SESS = new Map(); // sid -> { profiles: { [pid]: {name, ua, upstream, jar:{host->cookie}} } }
+function ensureSess(sid){ if(!SESS.has(sid)) SESS.set(sid,{profiles:{}}); return SESS.get(sid); }
+function makePid(){ return crypto.randomBytes(6).toString("hex"); }
+function jarGet(sid,pid,host){ const pr=ensureSess(sid).profiles[pid]; return pr && pr.jar[host] || ""; }
+function jarSet(sid,pid,host,setCookieHeaders){
   if(!setCookieHeaders) return;
-  const j = JAR.get(sid) || {};
-  const prev = j[host] || "";
-  const map = {}; // name -> val (без Domain/Path/…)
-  prev.split(/; */).forEach(p=>{ const eq=p.indexOf("="); if(eq>0){ map[p.slice(0,eq)] = p.slice(eq+1); } });
+  const pr=ensureSess(sid).profiles[pid]; if(!pr) return;
+  const map={};
+  const prev=pr.jar[host]||"";
+  prev.split(/; */).forEach(p=>{ const i=p.indexOf("="); if(i>0) map[p.slice(0,i)]=p.slice(i+1); });
   (Array.isArray(setCookieHeaders)?setCookieHeaders:[setCookieHeaders]).forEach(c=>{
-    const pair = c.split(";")[0]; const eq = pair.indexOf("=");
-    if(eq>0){ const name = pair.slice(0,eq).trim(); const val = pair.slice(eq+1).trim(); map[name]=val; }
+    const pair=(c||"").split(";")[0]; const i=pair.indexOf("="); if(i>0){ map[pair.slice(0,i).trim()]=pair.slice(i+1).trim(); }
   });
-  j[host] = Object.entries(map).map(([k,v])=>k+"="+v).join("; ");
-  JAR.set(sid, j);
+  pr.jar[host]=Object.entries(map).map(([k,v])=>k+"="+v).join("; ");
 }
 
-// ---- HTML rewriter
-function rewriteHtml(html, baseUrl){
-  let root;
-  try { root = parse(html); } catch { return html; }
+// ---- HTML rewriter (ссылки -> /m, ресурсы -> /p)
+function rewriteHtml(html, baseHref, pid){
+  let root; try{ root=parse(html); }catch{ return html; }
 
-  // убираем встроенный CSP, который ломает встраивание
-  root.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(m=>m.remove());
+  root.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(n=>n.remove());
 
-  // тэги-ресурсы → /p
-  const resAttrs = [["img","src"],["script","src"],["iframe","src"],["source","src"],["link","href"]];
-  resAttrs.forEach(([tag,attr])=>{
-    root.querySelectorAll(tag+"["+attr+"]").forEach(n=>{
-      const v=n.getAttribute(attr); if(!v) return;
-      try{
-        const abs = new URL(v, baseUrl).href;
-        n.setAttribute(attr, "/p?url="+encodeURIComponent(abs));
-      }catch{}
+  [["img","src"],["script","src"],["iframe","src"],["source","src"],["link","href"]]
+    .forEach(([tag,attr])=>{
+      root.querySelectorAll(tag+"["+attr+"]").forEach(n=>{
+        const v=n.getAttribute(attr); if(!v) return;
+        try{
+          const abs=new URL(v,baseHref).href;
+          n.setAttribute(attr, "/p?pid="+encodeURIComponent(pid)+"&url="+encodeURIComponent(abs));
+        }catch{}
+      });
     });
-  });
 
-  // ссылки → /m
   root.querySelectorAll("a[href]").forEach(n=>{
     const v=n.getAttribute("href"); if(!v) return;
     try{
-      const abs = new URL(v, baseUrl).href;
-      n.setAttribute("href", "/m?url="+encodeURIComponent(abs));
-      n.setAttribute("target", "_self");
+      const abs=new URL(v,baseHref).href;
+      n.setAttribute("href","/m?pid="+encodeURIComponent(pid)+"&url="+encodeURIComponent(abs));
+      n.setAttribute("target","_self");
     }catch{}
   });
 
-  // формы — отправляем через /p (без JS это не всегда идеал, но для демо ок)
-  root.querySelectorAll("form[action]").forEach(n=>{
-    const v=n.getAttribute("action"); if(!v) return;
-    try{
-      const abs = new URL(v, baseUrl).href;
-      n.setAttribute("action", "/p?url="+encodeURIComponent(abs));
-    }catch{}
-  });
-
-  // лёгкий скрипт: перехватываем pushState/клики на всякий
-  const helper = [
+  const helper=[
     "(function(){",
     "document.addEventListener('click',function(e){",
-    "  var a=e.target.closest && e.target.closest('a[href]');",
-    "  if(!a) return;",
-    "  var href=a.getAttribute('href');",
-    "  if(href && href.indexOf('/m?url=')===0){ e.preventDefault(); location.href=href; }",
+    "  var a=e.target.closest && e.target.closest('a[href]'); if(!a) return;",
+    "  var h=a.getAttribute('href'); if(h && h.indexOf('/m?pid=')===0){ e.preventDefault(); location.href=h; }",
     "},true);",
     "})();"
   ].join("\n");
-  const head = root.querySelector("head") || root;
-  head.insertAdjacentHTML("beforeend", "<script>"+helper.replace(/<\/script>/gi,"")+"</script>");
+  const head=root.querySelector("head")||root;
+  head.insertAdjacentHTML("beforeend","<script>"+helper.replace(/<\/script>/gi,"")+"</script>");
 
   return root.toString();
 }
 
-// ---- upstream request helper
-function upstreamRequest(t, opts, cb){
-  const mod = t.protocol==="https:" ? https : http;
-  const req = mod.request(Object.assign({
-    hostname: t.hostname,
-    port: t.port || (t.protocol==="https:"?443:80),
-    path: t.pathname + (t.search||""),
-    method: "GET",
-    headers: {
+// ---- upstream request (c Proxy Agent)
+function upstream(t, opts, pr, cb){
+  const isHttps=t.protocol==="https:";
+  const mod=isHttps?https:http;
+  const base={
+    hostname:t.hostname,
+    port:t.port || (isHttps?443:80),
+    path:t.pathname+(t.search||""),
+    method:opts.method||"GET",
+    headers:Object.assign({
       "Host": t.host,
-      "User-Agent": "Mozilla/5.0 (Sphere)",
-      "Accept": "*/*",
-      "Accept-Encoding": "identity",
-      "Connection": "close"
-    },
-    timeout: 20000
-  }, opts), cb);
-  return req;
+      "User-Agent": pr.ua || "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+      "Accept":"*/*",
+      "Accept-Encoding":"identity",
+      "Connection":"close",
+      "Cookie": opts.cookie || ""
+    }, opts.headers||{}),
+    timeout: 25000,
+    agent: undefined
+  };
+  if(pr.upstream){
+    try{
+      base.agent = isHttps ? new HttpsProxyAgent(pr.upstream) : new HttpProxyAgent(pr.upstream);
+    }catch{}
+  }
+  return mod.request(base, cb);
 }
 
 const proxy = httpProxy.createProxyServer({});
 const server = http.createServer(async (req,res)=>{
-  // health
   if(req.url==="/healthz"){ res.writeHead(200,{"Content-Type":"text/plain"}); return res.end("ok"); }
 
-  // выдаём UI
-  if(req.url==="/app"){
-    // гарантируем sid
-    const cookies = getCookies(req);
-    if(!cookies.sid){ setCookie(res,"sid",newSid()); }
+  // гарантируем sid
+  let sid=(getCookies(req).sid)||"";
+  if(!sid){ sid=newSid(); setCookie(res,"sid",sid); }
 
-    const html = [
+  // ---------- UI ----------
+  if(req.url==="/app"){
+    const html=[
       "<!doctype html>",
       "<html lang=\"ru\">",
       "<head>",
@@ -141,12 +133,8 @@ const server = http.createServer(async (req,res)=>{
       "  body{padding-top:env(safe-area-inset-top)}",
       "  .top{position:fixed;left:12px;right:12px;top:calc(env(safe-area-inset-top) + 10px);height:56px;display:flex;gap:10px;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--line);border-radius:16px;background:rgba(12,13,16,.85);backdrop-filter:blur(10px);z-index:10}",
       "  .brand{font-weight:800;letter-spacing:.6px}",
-      "  .chip{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--panel)}",
-      "  .toggle{width:40px;height:24px;border-radius:999px;border:1px solid var(--line);background:#222;position:relative}",
-      "  .dot{position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#6b7280;transition:.22s}",
-      "  .on .dot{left:18px;background:#1ee2a1}",
       "  .wrap{position:absolute;left:0;right:0;top:calc(env(safe-area-inset-top) + 56px + 24px);bottom:0;display:flex;align-items:center;justify-content:center}",
-      "  .field{position:relative;width:100%;max-width:460px;height:58vh;min-height:360px}",
+      "  .field{position:relative;width:100%;max-width:460px;height:60vh;min-height:360px}",
       "  .sphere{position:absolute;left:50%;top:35%;transform:translate(-50%,-50%);width:120px;height:120px;border-radius:50%;",
       "          background:radial-gradient(70% 60% at 35% 30%,rgba(230,240,255,.35),rgba(200,210,230,.09) 60%,rgba(180,190,205,.06) 70%,rgba(80,90,110,.05) 80%,rgba(0,0,0,.02) 100%),",
       "                     linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.02));",
@@ -154,40 +142,52 @@ const server = http.createServer(async (req,res)=>{
       "          border:1px solid rgba(255,255,255,.10); backdrop-filter:blur(18px) saturate(140%); display:flex;align-items:center;justify-content:center;cursor:grab;user-select:none;}",
       "  .plus{width:48px;height:48px;border-radius:50%;background:radial-gradient(60% 60% at 40% 35%, rgba(255,255,255,.35), rgba(255,255,255,.12) 60%, rgba(255,255,255,.06) 61%), linear-gradient(180deg,rgba(255,255,255,.25),rgba(255,255,255,.05)); display:flex;align-items:center;justify-content:center;box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}",
       "  .plus span{font-size:26px;font-weight:900;color:#ecf2ff;text-shadow:0 1px 0 rgba(0,0,0,.25)}",
-      "  .dock{position:absolute;left:0;right:0;bottom:8px;display:flex;justify-content:center;gap:14px}",
+      "  .dock{position:absolute;left:0;right:0;bottom:8px;display:flex;justify-content:center;gap:14px;flex-wrap:wrap}",
       "  .app{width:84px;height:84px;border-radius:50%;position:relative;display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);backdrop-filter:blur(14px) saturate(140%)}",
+      "  .app .lbl{position:absolute;bottom:-18px;font-size:12px;color:var(--muted)}",
       "  .icon{width:60px;height:60px;border-radius:22%/22%;background-size:cover}",
       "  .icon-insta{background-image:url('data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 48 48\"><defs><linearGradient id=\"g\" x1=\"0\" y1=\"1\" x2=\"1\" y2=\"0\"><stop offset=\"0\" stop-color=\"%23f58529\"/><stop offset=\"0.5\" stop-color=\"%23dd2a7b\"/><stop offset=\"1\" stop-color=\"%235159f6\"/></linearGradient></defs><rect width=\"48\" height=\"48\" rx=\"11\" fill=\"url(%23g)\"/><circle cx=\"24\" cy=\"24\" r=\"9\" fill=\"white\"/><circle cx=\"24\" cy=\"24\" r=\"6\" fill=\"%23f58529\"/><circle cx=\"34\" cy=\"14\" r=\"3\" fill=\"white\"/></svg>')}",
       "  .icon-tg{background-image:url('data:image/svg+xml;utf8,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 48 48\"><rect width=\"48\" height=\"48\" rx=\"11\" fill=\"%2329a9eb\"/><path fill=\"white\" d=\"M38 12 9 23l9 3 2 8 5-6 8 6 5-22z\"/></svg>')}",
-      "  .sheet{position:fixed;left:0;right:0;bottom:0;top:0;background:rgba(0,0,0,.5);display:none;align-items:flex-end;z-index:20}",
+      "  .sheet{position:fixed;left:0;right:0;bottom:0;top:0;background:rgba(0,0,0,.45);display:none;align-items:flex-end;z-index:30}",
       "  .sheet.open{display:flex}",
-      "  .sheet .box{width:100%;background:var(--panel);border-top-left-radius:18px;border-top-right-radius:18px;border-top:1px solid var(--line);padding:14px}",
-      "  .box h3{margin:4px 0 10px 0}",
-      "  .opt{display:flex;gap:10px;align-items:center;padding:10px;border:1px solid var(--line);border-radius:12px;margin-bottom:10px}",
+      "  .box{width:100%;background:var(--panel);border-top-left-radius:18px;border-top-right-radius:18px;border-top:1px solid var(--line);padding:14px}",
+      "  .row{display:flex;gap:8px}",
+      "  .fieldset{display:flex;flex-direction:column;gap:6px;flex:1}",
+      "  .in{padding:10px;border:1px solid var(--line);background:#0e1116;color:var(--text);border-radius:10px}",
       "  .btn{padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--text)}",
       "  .panel{position:fixed;left:0;right:0;bottom:0;top:calc(env(safe-area-inset-top) + 56px + 24px);background:#0b0d10;border-top:1px solid var(--line);z-index:25;display:none;flex-direction:column}",
       "  .panel.open{display:flex}",
       "  .panel-bar{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--line)}",
       "  .panel-title{font-weight:700}",
       "  .panel-actions{display:flex;gap:8px}",
-      "  .panel-msg{flex:1;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;padding:22px}",
       "  .panel-frame{flex:1;border:0;background:#000}",
+      "  .panel-msg{flex:1;display:flex;align-items:center;justify-content:center;color:var(--muted);padding:22px;text-align:center}",
       "</style>",
       "</head>",
       "<body>",
-      "  <div class=\"top\"><div class=\"brand\">SPHERE</div><div class=\"chip\"><span>Proxy:</span><div class=\"toggle on\" id=\"proxyToggle\"><div class=\"dot\"></div></div></div></div>",
+      "  <div class=\"top\"><div class=\"brand\">SPHERE</div></div>",
       "  <div class=\"wrap\"><div class=\"field\" id=\"field\">",
       "    <div class=\"sphere\" id=\"big\"><div class=\"plus\"><span>+</span></div></div>",
       "    <div class=\"dock\" id=\"dock\"></div>",
       "  </div></div>",
       "  <div class=\"sheet\" id=\"sheet\"><div class=\"box\">",
-      "    <h3>Добавить приложение</h3>",
-      "    <div class=\"opt\" data-id=\"instagram\"><div class=\"icon icon-insta\"></div><div style=\"flex:1\">Instagram</div><button class=\"btn\">Добавить</button></div>",
-      "    <div class=\"opt\" data-id=\"telegram\"><div class=\"icon icon-tg\"></div><div style=\"flex:1\">Telegram Web</div><button class=\"btn\">Добавить</button></div>",
-      "    <button class=\"btn\" id=\"closeSheet\" style=\"width:100%;margin-top:6px\">Отмена</button>",
+      "    <div style=\"font-weight:700;margin-bottom:8px\">Добавить приложение</div>",
+      "    <div class=\"row\">",
+      "      <div class=\"fieldset\"><label>Название</label><input class=\"in\" id=\"appName\" placeholder=\"Instagram\"/></div>",
+      "    </div>",
+      "    <div class=\"row\" style=\"margin-top:8px\">",
+      "      <div class=\"fieldset\"><label>URL (главная)</label><input class=\"in\" id=\"appUrl\" placeholder=\"https://www.instagram.com/\"/></div>",
+      "    </div>",
+      "    <div class=\"row\" style=\"margin-top:8px\">",
+      "      <div class=\"fieldset\"><label>Прокси (необязательно, http://user:pass@host:port)</label><input class=\"in\" id=\"appProxy\" placeholder=\"http://login:pass@1.2.3.4:8080\"/></div>",
+      "    </div>",
+      "    <div class=\"row\" style=\"margin-top:8px\">",
+      "      <div class=\"fieldset\"><label>User-Agent</label><input class=\"in\" id=\"appUA\" placeholder=\"iPhone Safari UA (по умолчанию)\"/></div>",
+      "    </div>",
+      "    <div class=\"row\" style=\"margin-top:10px\"><button class=\"btn\" id=\"addApp\">Добавить</button><button class=\"btn\" id=\"closeSheet\" style=\"flex:1\">Отмена</button></div>",
       "  </div></div>",
       "  <div class=\"panel\" id=\"panel\">",
-      "    <div class=\"panel-bar\"><div class=\"panel-title\" id=\"panelTitle\"></div><div class=\"panel-actions\"><button class=\"btn\" id=\"openExternal\">Открыть через прокси</button><button class=\"btn\" id=\"openDeeplink\" style=\"display:none\">Открыть в приложении</button><button class=\"btn\" id=\"closePanel\">Закрыть</button></div></div>",
+      "    <div class=\"panel-bar\"><div class=\"panel-title\" id=\"panelTitle\"></div><div class=\"panel-actions\"><button class=\"btn\" id=\"btnIP\">IP профиля</button><button class=\"btn\" id=\"btnReset\">Сбросить сессию</button><button class=\"btn\" id=\"closePanel\">Закрыть</button></div></div>",
       "    <iframe id=\"panelFrame\" class=\"panel-frame\"></iframe>",
       "    <div id=\"panelMsg\" class=\"panel-msg\" style=\"display:none\"></div>",
       "  </div>",
@@ -197,66 +197,67 @@ const server = http.createServer(async (req,res)=>{
     res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"}); return res.end(html);
   }
 
-  // фронтенд-логика
+  // ---------- client JS ----------
   if(req.url==="/app.js"){
-    const js = [
+    const js=[
       "(function(){",
-      "  var PROXY='/p?url='; var MHTML='/m?url=';",
-      "  var state={apps: JSON.parse(localStorage.getItem('sphereApps')||'[]')};",
-      "  var CATALOG={",
-      "    instagram:{id:'instagram',name:'Instagram',url:'https://www.instagram.com/',allow:false,deeplink:'instagram://app',icon:'insta'},",
-      "    telegram:{id:'telegram',name:'Telegram',url:'https://web.telegram.org/',allow:true,deeplink:'tg://',icon:'tg'}",
-      "  };",
-      "  function save(){ localStorage.setItem('sphereApps',JSON.stringify(state.apps)); }",
+      "  var state={profiles: JSON.parse(localStorage.getItem('sphere_profiles')||'[]')};",
+      "  function save(){ localStorage.setItem('sphere_profiles',JSON.stringify(state.profiles)); }",
       "  function el(id){return document.getElementById(id)}",
+      "  function renderDock(){ var d=el('dock'); d.innerHTML=''; state.profiles.forEach(function(p){ var w=document.createElement('div'); w.className='app'; var ic=document.createElement('div'); ic.className='icon '+(p.icon||'icon-insta'); w.appendChild(ic); var lbl=document.createElement('div'); lbl.className='lbl'; lbl.textContent=p.name; w.appendChild(lbl); w.onclick=function(){ openProfile(p); }; d.appendChild(w); }); }",
       "  function openSheet(){ el('sheet').classList.add('open'); }",
       "  function closeSheet(){ el('sheet').classList.remove('open'); }",
-      "  function addApp(id){ var a=CATALOG[id]; if(!a) return; if(!state.apps.find(x=>x.id===id)){ state.apps.push(a); save(); renderDock(); } closeSheet(); }",
-      "  function proxyUrl(u){ return PROXY+encodeURIComponent(u); }",
-      "  function mUrl(u){ return MHTML+encodeURIComponent(u); }",
-      "  function openApp(a){ var p=el('panel'), fr=el('panelFrame'), msg=el('panelMsg'); el('panelTitle').textContent=a.name; p.classList.add('open'); msg.style.display='none'; fr.style.display='block'; if(a.allow){ fr.src=mUrl(a.url); } else { fr.style.display='none'; msg.style.display='flex'; msg.textContent='Сервис блокирует встраивание. Нажми «Открыть через прокси» (новая вкладка) или «Открыть в приложении».'; } el('openExternal').onclick=function(){ window.open(proxyUrl(a.url),'_blank'); }; el('openDeeplink').style.display=a.deeplink?'inline-flex':'none'; el('openDeeplink').onclick=function(){ if(a.deeplink) location.href=a.deeplink; }; }",
+      "  function addApp(){ var name=el('appName').value||'Instagram'; var url=el('appUrl').value||'https://www.instagram.com/'; var proxy=el('appProxy').value||''; var ua=el('appUA').value||''; fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,url:url,upstream:proxy,ua:ua})}).then(r=>r.json()).then(function(p){ state.profiles.push(p); save(); renderDock(); closeSheet(); }); }",
+      "  function openProfile(p){ var pan=el('panel'), fr=el('panelFrame'), msg=el('panelMsg'); el('panelTitle').textContent=p.name; pan.classList.add('open'); fr.style.display='block'; msg.style.display='none'; fr.src='/m?pid='+encodeURIComponent(p.pid)+'&url='+encodeURIComponent(p.url); el('btnIP').onclick=function(){ fetch('/api/ip?pid='+encodeURIComponent(p.pid)).then(r=>r.text()).then(t=>alert('IP профиля: '+t)).catch(e=>alert(e)); }; el('btnReset').onclick=function(){ fetch('/api/reset?pid='+encodeURIComponent(p.pid),{method:'POST'}).then(()=>alert('Ок. Перезапусти вкладку профиля.')); }; }",
       "  function closePanel(){ el('panel').classList.remove('open'); el('panelFrame').src='about:blank'; }",
-      "  function renderDock(){ var d=el('dock'); d.innerHTML=''; state.apps.forEach(function(a){ var wrap=document.createElement('div'); wrap.className='app'; var ic=document.createElement('div'); ic.className='icon '+(a.icon==='insta'?'icon-insta':'icon-tg'); wrap.appendChild(ic); wrap.onclick=function(){ openApp(a); }; d.appendChild(wrap); }); }",
-      "  function bind(){ el('closeSheet').onclick=closeSheet; Array.prototype.forEach.call(document.querySelectorAll('.opt'),function(n){ n.querySelector('.btn').onclick=function(){ addApp(n.getAttribute('data-id')); }; }); el('sheet').addEventListener('click',function(e){ if(e.target.id==='sheet') closeSheet(); }); el('big').onclick=function(){ openSheet(); }; el('closePanel').onclick=closePanel; }",
-      "  // простая инерция для шара",
-      "  (function(){ var f=el('field'), s=el('big'); var vx=0,vy=0,drag=false,px=0,py=0; function bounds(){ var r=s.offsetWidth/2, w=f.clientWidth, h=f.clientHeight; var x=s.offsetLeft+r, y=s.offsetTop+r; if(x<r){ s.style.left=(0)+'px'; vx*=-.6;} if(x>w-r){ s.style.left=(w-2*r)+'px'; vx*=-.6;} if(y<r){ s.style.top=(0)+'px'; vy*=-.6;} if(y>h-r){ s.style.top=(h-2*r)+'px'; vy*=-.6;} } function step(){ if(!drag){ var x=s.offsetLeft, y=s.offsetTop; x+=vx; y+=vy; vx*=.98; vy*=.98; s.style.left=x+'px'; s.style.top=y+'px'; bounds(); } requestAnimationFrame(step);} step(); function onDown(e){ drag=true; px=e.touches?e.touches[0].clientX:e.clientX; py=e.touches?e.touches[0].clientY:e.clientY; } function onMove(e){ if(!drag) return; var x=e.touches?e.touches[0].clientX:e.clientX, y=e.touches?e.touches[0].clientY:e.clientY; vx=x-px; vy=y-py; s.style.left=(s.offsetLeft+vx)+'px'; s.style.top=(s.offsetTop+vy)+'px'; px=x; py=y; } function onUp(){ drag=false; } s.addEventListener('mousedown',onDown); s.addEventListener('touchstart',onDown); window.addEventListener('mousemove',onMove,{passive:false}); window.addEventListener('touchmove',onMove,{passive:false}); window.addEventListener('mouseup',onUp); window.addEventListener('touchend',onUp); })();",
-      "  function boot(){ bind(); renderDock(); }",
-      "  boot();",
+      "  // физика сферы",
+      "  (function(){ var f=el('field'), s=el('big'); var vx=0,vy=0,drag=false,px=0,py=0; function bounds(){ var r=s.offsetWidth/2, w=f.clientWidth, h=f.clientHeight; var x=s.offsetLeft+r, y=s.offsetTop+r; if(x<r){ s.style.left=(0)+'px'; vx*=-.6;} if(x>w-r){ s.style.left=(w-2*r)+'px'; vx*=-.6;} if(y<r){ s.style.top=(0)+'px'; vy*=-.6;} if(y>h-r){ s.style.top=(h-2*r)+'px'; vy*=-.6;} } function step(){ if(!drag){ var x=s.offsetLeft, y=s.offsetTop; x+=vx; y+=vy; vx*=.98; vy*=.98; s.style.left=x+'px'; s.style.top=y+'px'; bounds(); } requestAnimationFrame(step);} step(); function down(e){ drag=true; px=e.touches?e.touches[0].clientX:e.clientX; py=e.touches?e.touches[0].clientY:e.clientY; } function move(e){ if(!drag) return; var x=e.touches?e.touches[0].clientX:e.clientX, y=e.touches?e.touches[0].clientY:e.clientY; vx=x-px; vy=y-py; s.style.left=(s.offsetLeft+vx)+'px'; s.style.top=(s.offsetTop+vy)+'px'; px=x; py=y; } function up(){ drag=false; } s.addEventListener('mousedown',down); s.addEventListener('touchstart',down); window.addEventListener('mousemove',move,{passive:false}); window.addEventListener('touchmove',move,{passive:false}); window.addEventListener('mouseup',up); window.addEventListener('touchend',up); s.addEventListener('click',function(){ if(!drag) openSheet(); }); })();",
+      "  el('closeSheet').onclick=function(){ closeSheet(); };",
+      "  el('addApp').onclick=addApp;",
+      "  el('closePanel').onclick=closePanel;",
+      "  renderDock();",
       "})();"
     ].join("\n");
     res.writeHead(200,{"Content-Type":"text/javascript; charset=utf-8"}); return res.end(js);
   }
 
-  // ---------- HTML-режим (переписывание) ----------
-  if(req.url.startsWith("/m?")){
-    const sid = getCookies(req).sid || "";
-    const q = new URL(req.url, "http://local"); const target = q.searchParams.get("url");
-    if(!target){ res.writeHead(400); return res.end("Missing url"); }
-    let t; try{ t=new URL(target); }catch{ res.writeHead(400); return res.end("Bad url"); }
+  // ---------- Profiles API ----------
+  if(req.url.startsWith("/api/profile") && req.method==="POST"){
+    const b=JSON.parse(await readBody(req)||"{}");
+    const pid=makePid();
+    const pr={ pid, name: String(b.name||"App"), url: String(b.url||"https://example.com/"), ua: String(b.ua||""), upstream: String(b.upstream||""), jar:{} };
+    ensureSess(sid).profiles[pid]=pr;
+    res.writeHead(200,{"Content-Type":"application/json"}); return res.end(JSON.stringify(pr));
+  }
+  if(req.url.startsWith("/api/ip")){
+    const u=new URL(req.url,"http://local"); const pid=u.searchParams.get("pid"); const pr=ensureSess(sid).profiles[pid]; if(!pr){ res.writeHead(404); return res.end("no profile"); }
+    const t=new URL("https://api.ipify.org"); const r=upstream(t,{headers:{}},pr,u2=>{ const chunks=[]; u2.on("data",d=>chunks.push(d)); u2.on("end",()=>{ res.writeHead(200,{"Content-Type":"text/plain"}); res.end(Buffer.concat(chunks).toString("utf8")); });}); r.on("error",e=>{ res.writeHead(502); res.end("err: "+e.message); }); r.end(); return;
+  }
+  if(req.url.startsWith("/api/reset") && req.method==="POST"){
+    const u=new URL(req.url,"http://local"); const pid=u.searchParams.get("pid"); const pr=ensureSess(sid).profiles[pid]; if(!pr){ res.writeHead(404); return res.end("no profile"); }
+    pr.jar={}; res.writeHead(204); return res.end();
+  }
 
-    const up = upstreamRequest(t, {
-      headers: Object.assign({}, req.headers, {
-        "Host": t.host,
-        "Accept-Encoding": "identity",
-        "Cookie": jarGet(sid, t.host)
-      })
-    }, u=>{
-      const ct = u.headers["content-type"]||"";
+  // ---------- HTML mode (/m) ----------
+  if(req.url.startsWith("/m?")){
+    const u=new URL(req.url,"http://local"); const pid=u.searchParams.get("pid"); const target=u.searchParams.get("url");
+    const pr=ensureSess(sid).profiles[pid]; if(!pr){ res.writeHead(404); return res.end("no profile"); }
+    let t; try{ t=new URL(target); }catch{ res.writeHead(400); return res.end("bad url"); }
+
+    const up=upstream(t,{cookie:jarGet(sid,pid,t.host)},pr, u2=>{
+      const ct=u2.headers["content-type"]||"";
       const chunks=[];
-      u.on("data",d=>chunks.push(d));
-      u.on("end",()=>{
-        jarSet(sid, t.host, u.headers["set-cookie"]);
-        let body = Buffer.concat(chunks);
-        res.removeHeader("Content-Security-Policy");
-        res.removeHeader("X-Frame-Options");
+      u2.on("data",d=>chunks.push(d));
+      u2.on("end",()=>{
+        jarSet(sid,pid,t.host,u2.headers["set-cookie"]);
         if(ct.includes("text/html")){
-          let txt = body.toString("utf8");
-          try{ txt = rewriteHtml(txt, t.href); }catch{}
-          res.writeHead(u.statusCode||200, {"content-type":"text/html; charset=utf-8","access-control-allow-origin":"*"});
-          return res.end(txt);
-        } else {
-          res.writeHead(u.statusCode||200, Object.assign({},u.headers,{"access-control-allow-origin":"*"}));
-          return res.end(body);
+          let text=Buffer.concat(chunks).toString("utf8");
+          try{ text=rewriteHtml(text,t.href,pid); }catch{}
+          res.writeHead(u2.statusCode||200,{"content-type":"text/html; charset=utf-8","access-control-allow-origin":"*"});
+          return res.end(text);
+        }else{
+          res.writeHead(u2.statusCode||200,Object.assign({},u2.headers,{"access-control-allow-origin":"*"}));
+          return res.end(Buffer.concat(chunks));
         }
       });
     });
@@ -265,49 +266,35 @@ const server = http.createServer(async (req,res)=>{
     return;
   }
 
-  // ---------- универсальный прокси (ресурсы, XHR и т.д.) ----------
+  // ---------- resource proxy (/p) ----------
   if(req.url.startsWith("/p?")){
     if(req.method==="OPTIONS"){ setCORS(res); res.writeHead(204); return res.end(); }
     setCORS(res);
-    const sid = getCookies(req).sid || "";
-    const q = new URL(req.url, "http://local"); const target = q.searchParams.get("url");
-    if(!target){ res.writeHead(400); return res.end("Missing url"); }
-    let t; try{ t=new URL(target); }catch{ res.writeHead(400); return res.end("Bad url"); }
+    const u=new URL(req.url,"http://local"); const pid=u.searchParams.get("pid"); const target=u.searchParams.get("url");
+    const pr=ensureSess(sid).profiles[pid]; if(!pr){ res.writeHead(404); return res.end("no profile"); }
+    let t; try{ t=new URL(target); }catch{ res.writeHead(400); return res.end("bad url"); }
 
-    const up = upstreamRequest(t, {
-      method: req.method,
-      headers: Object.assign({}, req.headers, {
-        "Host": t.host,
-        "Accept-Encoding": "identity",
-        "Cookie": jarGet(sid, t.host)
-      })
-    }, u=>{
-      jarSet(sid, t.host, u.headers["set-cookie"]);
-      const h = Object.assign({},u.headers,{"access-control-allow-origin":"*"});
-      delete h["content-security-policy"]; delete h["x-frame-options"]; delete h["content-security-policy-report-only"];
-      delete h["set-cookie"]; // не отдаём браузеру куки чужого домена — держим в серверной jar
-      res.writeHead(u.statusCode||200, h);
-      u.pipe(res);
+    const up=upstream(t,{method:req.method, cookie:jarGet(sid,pid,t.host), headers:{}},pr, u2=>{
+      jarSet(sid,pid,t.host,u2.headers["set-cookie"]);
+      const h=Object.assign({},u2.headers,{"access-control-allow-origin":"*"});
+      delete h["x-frame-options"]; delete h["content-security-policy"]; delete h["content-security-policy-report-only"]; delete h["set-cookie"];
+      res.writeHead(u2.statusCode||200,h); u2.pipe(res);
     });
     up.on("error",e=>{ res.writeHead(502); res.end("Fetch error: "+e.message); });
-
-    // проброс тела POST/PUT
-    if(req.method!=="GET"&&req.method!=="HEAD"){
-      req.pipe(up);
-    } else up.end();
+    if(req.method!=="GET"&&req.method!=="HEAD"){ req.pipe(up); } else up.end();
     return;
   }
 
-  // классический форвард-прокси (для совместимости; может блокироваться PaaS)
+  // --- на всякий случай: forward proxy для curl
   if(!authOk(req)){ res.writeHead(407,{"Proxy-Authenticate":"Basic realm=\"Proxy\""}); return res.end("Proxy auth required"); }
-  proxy.web(req,res,{target:req.url,changeOrigin:true},(err)=>{ res.writeHead(502); res.end("Bad gateway: "+err.message); });
+  proxy.web(req,res,{target:req.url,changeOrigin:true},err=>{ res.writeHead(502); res.end("Bad gateway: "+err.message); });
 });
 
-// CONNECT для HTTPS
+// CONNECT — если захочешь пользоваться как обычным прокси
 server.on("connect",(req,clientSocket,head)=>{
   if(!authOk(req)){ clientSocket.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"); return clientSocket.end(); }
-  const hp=(req.url||"").split(":"); const serverSocket=net.connect(hp[1]||443,hp[0],()=>{ clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n"); if(head&&head.length) serverSocket.write(head); serverSocket.pipe(clientSocket); clientSocket.pipe(serverSocket); });
+  const hp=(req.url||"").split(":");
+  const serverSocket=net.connect(hp[1]||443,hp[0],()=>{ clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n"); if(head&&head.length) serverSocket.write(head); serverSocket.pipe(clientSocket); clientSocket.pipe(serverSocket); });
   serverSocket.on("error",()=>{ clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n"); clientSocket.end(); });
 });
-
 server.listen(PORT,()=>console.log("Sphere running on "+PORT));
