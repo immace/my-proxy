@@ -1,11 +1,4 @@
-// server.js — Sphere: веб-приложение + Telegram-логин + тумблер Proxy + профиль .mobileconfig
-// Работает на Render. Эндпоинты:
-//   /app                       — UI Sphere
-//   /Sphere.mobileconfig       — профиль для ярлыка на iOS
-//   /fetch?url=...             — прокси-запрос через наш сервер (демонстрирует “чужой IP”)
-//   /api/me, /auth/telegram    — авторизация через Telegram Login Widget
-//   /healthz                   — проверка живости
-// Плюс оставлен форвард-прокси/CONNECT (может блокироваться Cloudflare/PaaS).
+// server.js — Sphere: UI + Telegram-логин + тумблер Proxy + профиль .mobileconfig
 
 const http = require("http");
 const https = require("https");
@@ -14,13 +7,13 @@ const crypto = require("crypto");
 const httpProxy = require("http-proxy");
 const { URL } = require("url");
 
-// ====== Настройки (меняй в Render → Environment) =========================
-const USER = process.env.PROXY_USER || "student";   // логин для /fetch
-const PASS = process.env.PROXY_PASS || "mypassword";// пароль для /fetch
-const BOT_NAME = process.env.TG_BOT_NAME || "";     // @username твоего бота (без @)
-const BOT_TOKEN = process.env.TG_BOT_TOKEN || "";   // токен бота (у BotFather)
+// ===== Env =====
+const USER = process.env.PROXY_USER || "student";
+const PASS = process.env.PROXY_PASS || "mypassword";
+const BOT_NAME = process.env.TG_BOT_NAME || "";   // имя бота БЕЗ @
+const BOT_TOKEN = process.env.TG_BOT_TOKEN || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || "change_me_secret";
-// =======================================================================
+// ===============
 
 function setCORS(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -37,10 +30,9 @@ function authOk(req) {
   return decoded === `${USER}:${PASS}`;
 }
 
-// простая “подписанная” сессия (без БД)
-function signSession(payloadObj) {
-  const json = JSON.stringify(payloadObj);
-  const b64 = Buffer.from(json, "utf8").toString("base64url");
+// простая «подписанная» сессия
+function signSession(obj) {
+  const b64 = Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
   const mac = crypto.createHmac("sha256", SESSION_SECRET).update(b64).digest("base64url");
   return `${b64}.${mac}`;
 }
@@ -49,35 +41,30 @@ function verifySession(token) {
   const [b64, mac] = token.split(".");
   const mac2 = crypto.createHmac("sha256", SESSION_SECRET).update(b64).digest("base64url");
   if (mac !== mac2) return null;
-  try { return JSON.parse(Buffer.from(b64, "base64url").toString("utf8")); }
-  catch { return null; }
+  try { return JSON.parse(Buffer.from(b64, "base64url").toString("utf8")); } catch { return null; }
 }
 function getCookies(req) {
-  const c = req.headers.cookie || "";
   const out = {};
-  c.split(";").forEach(p => {
-    const i = p.indexOf("="); if (i>0) out[p.slice(0,i).trim()] = decodeURIComponent(p.slice(i+1));
+  (req.headers.cookie || "").split(";").forEach(p => {
+    const i = p.indexOf("="); if (i > 0) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1));
   });
   return out;
 }
-function setCookie(res, name, val, days=30) {
-  const exp = new Date(Date.now()+days*864e5).toUTCString();
+function setCookie(res, name, val, days = 30) {
+  const exp = new Date(Date.now() + days * 864e5).toUTCString();
   res.setHeader("Set-Cookie", `${name}=${encodeURIComponent(val)}; Path=/; Expires=${exp}; HttpOnly; SameSite=Lax; Secure`);
 }
 
-// верификация Telegram Login (https://core.telegram.org/widgets/login)
+// верификация Telegram Login
 function checkTelegramAuth(data) {
-  // data: объект из query/body (ключи: id, first_name, auth_date, hash, и т.д.)
   if (!BOT_TOKEN) return null;
   const { hash, ...rest } = data;
-  const keys = Object.keys(rest).sort();
-  const dataCheckString = keys.map(k => `${k}=${rest[k]}`).join("\n");
+  const dataCheckString = Object.keys(rest).sort().map(k => `${k}=${rest[k]}`).join("\n");
   const secret = crypto.createHash("sha256").update(BOT_TOKEN).digest();
   const hmac = crypto.createHmac("sha256", secret).update(dataCheckString).digest("hex");
   if (hmac !== hash) return null;
-  // опционально — проверка свежести (в пределах дня)
-  const now = Math.floor(Date.now()/1000);
-  if (Math.abs(now - Number(rest.auth_date||now)) > 86400) return null;
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - Number(rest.auth_date || now)) > 86400) return null;
   return {
     id: String(rest.id),
     username: rest.username || "",
@@ -86,29 +73,21 @@ function checkTelegramAuth(data) {
     photo_url: rest.photo_url || ""
   };
 }
-
 function readBody(req) {
   return new Promise(resolve => {
     const chunks = [];
     req.on("data", d => chunks.push(d));
-    req.on("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf8");
-      resolve(raw);
-    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
   });
 }
 
 const proxy = httpProxy.createProxyServer({});
 const server = http.createServer(async (req, res) => {
-  // 0) healthz
-  if (req.url === "/healthz") {
-    res.writeHead(200, {"Content-Type":"text/plain"}); return res.end("ok");
-  }
+  // health
+  if (req.url === "/healthz") { res.writeHead(200, {"Content-Type":"text/plain"}); return res.end("ok"); }
 
-  // 1) UI Sphere
+  // UI
   if (req.url.startsWith("/app")) {
-    const isAuthed = !!verifySession(getCookies(req).sid);
-    const host = req.headers.host;
     const html = `<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"/>
@@ -117,11 +96,11 @@ const server = http.createServer(async (req, res) => {
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Sphere</title>
 <style>
-  :root{--bg:#0b0d10;--panel:#121418;--line:#1f2329;--text:#e8e8e8;--muted:#a7b0bb;--accent:#6dd5ff}
+  :root{--bg:#0b0d10;--panel:#121418;--line:#1f2329;--text:#e8e8e8;--muted:#a7b0bb}
   html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,system-ui,Segoe UI,Roboto}
   .top{position:fixed;left:0;right:0;top:0;height:56px;display:flex;gap:10px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:rgba(12,13,14,.9);backdrop-filter:blur(6px);z-index:2}
   .brand{font-weight:800;letter-spacing:.6px}
-  .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--panel);color:var(--text)}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--panel)}
   .toggle{width:38px;height:22px;border-radius:999px;border:1px solid var(--line);background:#222;position:relative}
   .dot{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#666;transition:.2s}
   .on .dot{left:18px;background:#1ee2a1}
@@ -131,12 +110,11 @@ const server = http.createServer(async (req, res) => {
   .muted{color:var(--muted)}
   .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:12px}
   .app{aspect-ratio:1/1;border:1px dashed var(--line);border-radius:14px;display:flex;align-items:center;justify-content:center;color:var(--muted)}
-  .app.add{border-style:solid;color:var(--text)}
-  .btn{padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--text)}
+  .app.add{border-style:solid;color:#e8e8e8}
+  .btn{padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:#e8e8e8}
   iframe.browser{width:100%;height:60vh;border:1px solid var(--line);border-radius:12px;background:#000;margin-top:12px}
   .center{display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;height:calc(100% - 56px)}
-  .telbtn{display:inline-block;padding:10px 14px;border-radius:12px;background:#27a7e7;color:#fff;text-decoration:none}
-  input.name{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:#0f1114;color:var(--text)}
+  input.name{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:#0f1114;color:#e8e8e8}
 </style>
 </head><body>
 <div class="top">
@@ -152,7 +130,8 @@ const server = http.createServer(async (req, res) => {
 <script>
 const PROXY_BASE = "/fetch";
 const AUTH = "Basic " + btoa("${USER}:${PASS}");
-const state = { proxy: true, me: null, services: [] };
+const BOT_NAME = ${JSON.stringify(BOT_NAME)};
+const state = { proxy: true, me: null };
 
 async function apiMe(){ const r = await fetch("/api/me",{credentials:"include"}); return r.json(); }
 async function loginName(name){
@@ -189,11 +168,12 @@ function renderUnauthed(){
   root.innerHTML = \`
   <div class="center">
     <div style="font-size:17px;font-weight:700">Вход в Sphere</div>
-    ${BOT_NAME ? \`<script async src="https://telegram.org/js/telegram-widget.js?22"
-      data-telegram-login="${BOT_NAME}"
-      data-size="large"
-      data-auth-url="/auth/telegram"
-      data-request-access="write"></script>\`
+    \${BOT_NAME
+      ? \`<script async src="https://telegram.org/js/telegram-widget.js?22"
+          data-telegram-login="\${BOT_NAME}"
+          data-size="large"
+          data-auth-url="/auth/telegram"
+          data-request-access="write"></script>\`
       : '<div class="muted">TG-бот не настроен (нет TG_BOT_NAME/TG_BOT_TOKEN)</div>'}
     <button class="btn" onclick="testProxy()">Показать IP через прокси</button>
   </div>\`;
@@ -241,11 +221,11 @@ async function boot(){
 boot();
 </script>
 </body></html>`;
-    res.writeHead(200, {"Content-Type":"text/html; charset=utf-8"});
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     return res.end(html);
   }
 
-  // 2) Профиль .mobileconfig (ярлык Sphere на Домой)
+  // профиль для iOS
   if (req.url === "/Sphere.mobileconfig") {
     const targetUrl = "https://" + req.headers.host + "/app";
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -278,39 +258,33 @@ boot();
     return res.end(xml);
   }
 
-  // 3) API авторизации
+  // API
   if (req.url.startsWith("/api/me")) {
     const me = verifySession(getCookies(req).sid) || {};
     res.writeHead(200, {"Content-Type":"application/json"}); return res.end(JSON.stringify(me));
   }
   if (req.url.startsWith("/api/name") && req.method === "POST") {
     const me = verifySession(getCookies(req).sid) || {};
-    const raw = await readBody(req); let name = "";
-    try { name = JSON.parse(raw).name || ""; } catch {}
-    const upd = { ...me, name: String(name).slice(0,40) };
-    const sid = signSession(upd);
+    let name = ""; try { name = JSON.parse(await readBody(req)).name || ""; } catch {}
+    const sid = signSession({ ...me, name: String(name).slice(0,40) });
     setCookie(res, "sid", sid);
     res.writeHead(200, {"Content-Type":"application/json"}); return res.end(JSON.stringify({ok:true}));
   }
   if (req.url.startsWith("/auth/telegram")) {
-    // Telegram шлёт данные либо как query (GET), либо как x-www-form-urlencoded (POST)
     let data = {};
     if (req.method === "POST") {
-      const raw = await readBody(req);
-      raw.split("&").forEach(p=>{ const [k,v] = p.split("="); if(k) data[decodeURIComponent(k)] = decodeURIComponent(v||""); });
+      (await readBody(req)).split("&").forEach(p => { const [k,v] = p.split("="); if (k) data[decodeURIComponent(k)] = decodeURIComponent(v||""); });
     } else {
-      const q = new URL(req.url, "http://local").searchParams;
-      q.forEach((v,k)=> data[k]=v);
+      const q = new URL(req.url, "http://local").searchParams; q.forEach((v,k)=> data[k]=v);
     }
     const user = checkTelegramAuth(data);
     if (!user) { res.writeHead(400, {"Content-Type":"text/plain"}); return res.end("Bad Telegram login"); }
     const sid = signSession({ id:user.id, first_name:user.first_name, username:user.username });
     setCookie(res, "sid", sid);
-    // вернём на /app
     res.writeHead(302, { "Location": "/app" }); return res.end();
   }
 
-  // 4) /fetch?url=... — reverse proxy (GET)
+  // /fetch — reverse proxy (GET)
   if (req.url.startsWith("/fetch")) {
     if (req.method === "OPTIONS") { setCORS(res); res.writeHead(204); return res.end(); }
     setCORS(res);
@@ -338,7 +312,7 @@ boot();
     return;
   }
 
-  // 5) Форвард-прокси (на всякий; может блокироваться PaaS)
+  // форвард-прокси (может блокироваться у провайдера)
   if (!authOk(req)) {
     res.writeHead(407, { "Proxy-Authenticate": 'Basic realm="Proxy"' });
     return res.end("Proxy auth required");
@@ -364,4 +338,4 @@ server.on("connect", (req, clientSocket, head) => {
 });
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log("Sphere running on "+PORT));
+server.listen(PORT, () => console.log("Sphere running on " + PORT));
